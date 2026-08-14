@@ -116,6 +116,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import subprocess
 import os
+import config
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -124,6 +125,33 @@ CORS(app)  # Enable CORS for all routes
 # Paths relative to the script location
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shakespeare.txt")
 MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.pt")
+
+# --- Lazy-loaded model (loaded once in-process, avoids extra torch subprocess) --- #
+_model = None
+_tokenizer = None
+
+def load_model():
+    global _model, _tokenizer
+    if _model is None:
+        checkpoint = torch.load(MODEL_FILE, map_location=config.DEVICE, weights_only=True)
+        tokenizer = CharTokenizer("".join(checkpoint['vocab']))
+        model = GPTModel(tokenizer.vocabulary_size, config.EMB_DIM, config.N_LAYER, config.N_HEAD, config.BLOCK_SIZE).to(config.DEVICE)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        _model, _tokenizer = model, tokenizer
+    return _model, _tokenizer
+
+def text_generate(model, tokenizer, seed="", max_new_tokens=500):
+    idx = torch.tensor(tokenizer.encode(seed), dtype=torch.long).unsqueeze(0).to(config.DEVICE) if seed else torch.zeros((1, 1), dtype=torch.long).to(config.DEVICE)
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -config.BLOCK_SIZE:]
+            logits, _ = model(idx_cond)
+            logits = logits[:, -1, :] / config.TEMPERATURE
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+    return tokenizer.decode(idx[0].tolist())
 
 # --- API Routes --- #
 
@@ -142,7 +170,7 @@ def get_status():
 def generate_output():
     data = request.json
     prompt = data.get('prompt', '')
-    length = data.get('length', 200)
+    length = int(data.get('length', 200))
 
     # Check if model file exists
     if not os.path.exists(MODEL_FILE):
@@ -153,26 +181,12 @@ def generate_output():
         })
 
     try:
-        result = subprocess.run(
-            ["python", "generate.py"],
-            capture_output=True,
-            text=True,
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            timeout=300
-        )
-        output = result.stdout + result.stderr
-        if not output.strip():
-            output = "Generation executed (no output captured)."
+        model, tokenizer = load_model()
+        output = text_generate(model, tokenizer, seed=prompt, max_new_tokens=length)
         return jsonify({
             "success": True,
             "output": output,
-            "log": "Generation initiated."
-        })
-    except subprocess.TimeoutExpired:
-        return jsonify({
-            "success": False,
-            "message": "Generation timed out.",
-            "log": "Generation process timed out after 5 minutes."
+            "log": "Generation complete."
         })
     except Exception as e:
         return jsonify({
@@ -235,4 +249,5 @@ def initiate_train():
 if __name__ == '__main__':
     import os
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
+    app.run(host='0.0.0.0', port=port, debug=debug, use_reloader=debug)

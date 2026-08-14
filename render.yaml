@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: cynaptics-02
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --workers 1 --threads 1 --timeout 120 --bind 0.0.0.0:$PORT
+    autoDeploy: true
